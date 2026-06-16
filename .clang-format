@@ -1,0 +1,19 @@
+---
+BasedOnStyle: google
+---
+Language: Cpp
+ColumnLimit: 120
+IncludeCategories:
+  - Regex: '^<(gtest|gflags|google|opencv2|boost)/'
+    Priority: 5
+  - Regex: '^"(gtest|gflags|google|opencv2|boost)/'
+    Priority: 5
+  - Regex: '^<(.*)(\.h>)$'
+    Priority: 1
+  - Regex: "^<"
+    Priority: 2
+  - Regex: '^"([a-zA-Z_]*)(\.h")$'
+    Priority: 3
+  - Regex: ".*"
+    Priority: 6
+---

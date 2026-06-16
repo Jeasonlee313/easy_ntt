@@ -1,0 +1,7 @@
+# src/tensorrt_engine/CMakeLists.txt
+
+file(GLOB TENSORRT_ENGINE_SRCS
+        ${CMAKE_CURRENT_SOURCE_DIR}/*.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/*.cu
+)
+set(TENSORRT_ENGINE_SRCS ${TENSORRT_ENGINE_SRCS} PARENT_SCOPE)

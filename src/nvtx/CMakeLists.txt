@@ -1,0 +1,1 @@
+set(NVTX_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/nvtx_scoped.cpp PARENT_SCOPE)

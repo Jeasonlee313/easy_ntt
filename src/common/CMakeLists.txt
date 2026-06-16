@@ -1,0 +1,2 @@
+set(COMMON_SRCS
+        PARENT_SCOPE)
