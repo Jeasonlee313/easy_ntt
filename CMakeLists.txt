@@ -35,7 +35,7 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|AARCH64|arm64|ARM64")
     )
     message(STATUS "TensorRT (aarch64): ${TENSORRT_INCLUDE_DIRS}; ${TENSORRT_LIB_DIR}")
 else ()
-    set(TENSORRT_ROOT "/usr/local/tensorrt")
+    set(TENSORRT_ROOT "/usr/local/tensorrt" CACHE PATH "TensorRT installation root")
     message(STATUS "Using ${TENSORRT_ROOT} as TensorRT Root Dir")
     set(TENSORRT_INCLUDE_DIRS ${TENSORRT_ROOT}/include)
     set(TENSORRT_LIBRARIES
@@ -99,8 +99,8 @@ target_include_directories(${PROJECT_NAME} PUBLIC include)
 target_link_libraries(${PROJECT_NAME} PRIVATE
         ${CUDA_LIBRARIES}
         ${TENSORRT_LIBRARIES}
-        glog
-        yaml-cpp
+        glog::glog
+        yaml-cpp::yaml-cpp
 )
 if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(${PROJECT_NAME} PRIVATE

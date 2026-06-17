@@ -19,7 +19,7 @@ target_link_libraries(
         GTest::GTest
         GTest::Main
         ${CUDA_LIBRARIES}
-        glog
+        glog::glog
         ${PROJECT_NAME}
         ${OpenCV_LIBS}
         ${TENSORRT_LIBRARIES}

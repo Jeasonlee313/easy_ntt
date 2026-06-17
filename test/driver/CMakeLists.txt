@@ -8,5 +8,5 @@ file(GLOB DRIVER_TEST_SRCS
 add_executable(driver_test ${DRIVER_TEST_SRCS})
 target_link_libraries(driver_test GTest::GTest GTest::Main)
 
-target_link_libraries(driver_test ${CUDA_LIBRARIES} glog ${PROJECT_NAME})
+target_link_libraries(driver_test ${CUDA_LIBRARIES} glog::glog ${PROJECT_NAME})
 gtest_discover_tests(driver_test)
