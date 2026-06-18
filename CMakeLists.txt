@@ -22,7 +22,6 @@ option(BUILD_TESTING "Build tests" ON)
 
 find_package(CUDA REQUIRED)
 find_package(glog REQUIRED)
-find_package(yaml-cpp REQUIRED)
 
 # Set TensorRT libraries (aarch64: /usr/.../aarch64-linux-gnu; else: TENSORRT_ROOT tree)
 if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|AARCH64|arm64|ARM64")
@@ -35,8 +34,13 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|AARCH64|arm64|ARM64")
     )
     message(STATUS "TensorRT (aarch64): ${TENSORRT_INCLUDE_DIRS}; ${TENSORRT_LIB_DIR}")
 else ()
-    set(TENSORRT_ROOT "/usr/local/tensorrt" CACHE PATH "TensorRT installation root")
-    message(STATUS "Using ${TENSORRT_ROOT} as TensorRT Root Dir")
+    if (DEFINED ENV{TENSORRT_ROOT})
+        set(TENSORRT_ROOT "$ENV{TENSORRT_ROOT}")
+        message(STATUS "Using TENSORRT_ROOT from environment: ${TENSORRT_ROOT}")
+    else ()
+        set(TENSORRT_ROOT "/usr/local/tensorrt" CACHE PATH "TensorRT installation root")
+        message(STATUS "Using ${TENSORRT_ROOT} as TensorRT Root Dir")
+    endif ()
     set(TENSORRT_INCLUDE_DIRS ${TENSORRT_ROOT}/include)
     set(TENSORRT_LIBRARIES
             ${TENSORRT_ROOT}/lib/libnvinfer.so
@@ -100,7 +104,6 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
         ${CUDA_LIBRARIES}
         ${TENSORRT_LIBRARIES}
         glog::glog
-        yaml-cpp::yaml-cpp
 )
 if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     target_compile_options(${PROJECT_NAME} PRIVATE
