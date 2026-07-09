@@ -261,6 +261,8 @@ void TensorRTEngine::AllocateIOBindingsMemory() {
 void TensorRTEngine::Cleanup() {
   tensor_map_.clear();
   user_binding_addresses_.clear();
+  input_ready_events_.clear();
+  output_ready_events_.clear();
   context_.reset();
   engine_.reset();
   runtime_.reset();
@@ -291,6 +293,52 @@ bool TensorRTEngine::Synchronize() const {
   if (!engine_ || !context_) return true;  // no-op on uninitialized engine
   cudaStream_t s = GetCudaStream();
   return (s != nullptr) ? (cudaStreamSynchronize(s) == cudaSuccess) : false;
+}
+
+cudaEvent_t TensorRTEngine::GetInputReadyEvent(const std::string &name) const {
+  auto it = input_ready_events_.find(name);
+  return it != input_ready_events_.end() ? it->second->event() : nullptr;
+}
+
+cudaEvent_t TensorRTEngine::GetOutputReadyEvent(const std::string &name) const {
+  auto it = output_ready_events_.find(name);
+  return it != output_ready_events_.end() ? it->second->event() : nullptr;
+}
+
+bool TensorRTEngine::WaitInputReady(const std::string &name, cudaStream_t stream) const {
+  auto it = input_ready_events_.find(name);
+  if (it == input_ready_events_.end()) {
+    LOG(ERROR) << "Input ready event not found: " << name;
+    return false;
+  }
+  return WaitEvent(stream, it->second);
+}
+
+bool TensorRTEngine::WaitOutputReady(const std::string &name, cudaStream_t stream) const {
+  auto it = output_ready_events_.find(name);
+  if (it == output_ready_events_.end()) {
+    LOG(ERROR) << "Output ready event not found: " << name;
+    return false;
+  }
+  return WaitEvent(stream, it->second);
+}
+
+bool TensorRTEngine::SynchronizeInput(const std::string &name) const {
+  auto it = input_ready_events_.find(name);
+  if (it == input_ready_events_.end()) {
+    LOG(ERROR) << "Input ready event not found: " << name;
+    return false;
+  }
+  return it->second->Synchronize();
+}
+
+bool TensorRTEngine::SynchronizeOutput(const std::string &name) const {
+  auto it = output_ready_events_.find(name);
+  if (it == output_ready_events_.end()) {
+    LOG(ERROR) << "Output ready event not found: " << name;
+    return false;
+  }
+  return it->second->Synchronize();
 }
 
 // ── Binding introspection ────────────────────────────────────────────
@@ -365,10 +413,13 @@ bool TensorRTEngine::SetInputData(const std::string &name, const void *data, siz
     return false;
   }
 
+  bool ok = false;
   if (async) {
-    return it->second->CopyFromHostAsync(data, *stream_);
+    ok = it->second->CopyFromHostAsync(data, *stream_);
+  } else {
+    ok = it->second->CopyFromHost(data);
   }
-  return it->second->CopyFromHost(data);
+  return ok && RecordInputReadyEvent(name);
 }
 
 // ── GetOutputData ────────────────────────────────────────────────────
@@ -398,6 +449,10 @@ bool TensorRTEngine::GetOutputData(const std::string &name, void *data, size_t s
   if (size_bytes != tensor->byte_size()) {
     LOG(ERROR) << "Output size mismatch for " << name << ": expected " << tensor->byte_size() << " bytes, got "
                << size_bytes;
+    return false;
+  }
+
+  if (!WaitOutputReady(name, stream_->stream())) {
     return false;
   }
 
@@ -436,6 +491,21 @@ bool TensorRTEngine::InferAsync() {
     return false;
   }
 
+  cudaStream_t exec_stream = GetCudaStream();
+  if (exec_stream == nullptr) {
+    LOG(ERROR) << "No valid CUDA stream for execution";
+    return false;
+  }
+
+  for (const auto &pair : tensor_map_) {
+    if (!pair.second->is_input()) continue;
+    auto event_it = input_ready_events_.find(pair.first);
+    if (event_it != input_ready_events_.end() && !WaitEvent(exec_stream, event_it->second)) {
+      LOG(ERROR) << "Failed to wait input ready event for: " << pair.first;
+      return false;
+    }
+  }
+
   if (!io_frozen_) {
     for (auto &pair : tensor_map_) {
       void *addr = pair.second->mutable_data();
@@ -449,7 +519,7 @@ bool TensorRTEngine::InferAsync() {
       }
     }
   }
-  return Enqueue();
+  return Enqueue() && RecordOutputReadyEvents(exec_stream);
 }
 
 // ── Binding shape & profile ──────────────────────────────────────────
@@ -719,6 +789,37 @@ bool TensorRTEngine::LoadPluginLibrary(const std::string &plugin_path) {
   return true;
 }
 
+bool TensorRTEngine::RecordInputReadyEvent(const std::string &name) {
+  auto event = std::make_shared<CudaEvent>(CudaEvent::Flag::DISABLE_TIMING);
+  if (!event->Record(stream_->stream())) {
+    LOG(ERROR) << "Failed to record input ready event for: " << name;
+    return false;
+  }
+  input_ready_events_[name] = event;
+  return true;
+}
+
+bool TensorRTEngine::RecordOutputReadyEvents(cudaStream_t stream) {
+  CUDA_RETURN_VAL_IF(stream == nullptr, false);
+  for (const auto &pair : tensor_map_) {
+    if (!pair.second->is_output()) continue;
+
+    auto event = std::make_shared<CudaEvent>(CudaEvent::Flag::DISABLE_TIMING);
+    if (!event->Record(stream)) {
+      LOG(ERROR) << "Failed to record output ready event for: " << pair.first;
+      return false;
+    }
+    output_ready_events_[pair.first] = event;
+  }
+  return true;
+}
+
+bool TensorRTEngine::WaitEvent(cudaStream_t stream, const std::shared_ptr<CudaEvent> &event) const {
+  CUDA_RETURN_VAL_IF(stream == nullptr || event == nullptr, false);
+  CUDART_RETURN_CALL(cudaStreamWaitEvent(stream, event->event(), 0));
+  return true;
+}
+
 bool TensorRTEngine::HasUnresolvedDims(const nvinfer1::Dims &dims) const {
   for (int32_t j = 0; j < dims.nbDims; ++j) {
     if (dims.d[j] == -1) return true;
@@ -748,4 +849,4 @@ bool TensorRTEngine::IsDeviceAccessiblePointer(const void *ptr) const {
 #endif
 }
 
-} // namespace tensorrt_engine
+}  // namespace tensorrt_engine

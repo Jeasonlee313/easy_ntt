@@ -11,12 +11,14 @@
 #include <unordered_map>
 #include <vector>
 
+#include "driver/cuda_event.h"
 #include "driver/cuda_stream.h"
 #include "tensorrt_engine/tensor.h"
 #include "tensorrt_engine/tensorrt_utility.hpp"
 #include "tensorrt_engine/trt_logger.h"
 
 namespace tensorrt_engine {
+using driver::event::CudaEvent;
 using driver::stream::CudaStream;
 using tensorrt_engine::logger::Logger;
 using tensorrt_engine::tensor::Tensor;
@@ -38,7 +40,9 @@ class TensorRTEngine {
   // Get output data
   bool GetOutputData(const std::string &name, void *data, size_t size_bytes, bool async);
 
-  // Run inference (synchronous)
+  // Run inference (synchronous). Deprecated: use InferAsync() plus event control
+  // or explicit Synchronize() instead.
+  [[deprecated("Use InferAsync() with tensor event control or explicit Synchronize() instead.")]]
   bool Infer();
 
   // Run inference (asynchronous)
@@ -59,6 +63,28 @@ class TensorRTEngine {
 
   //! @brief Synchronize the execution stream.
   bool Synchronize() const;
+
+  // ---------------------------------------------------------------------------
+  // Tensor event control
+  // ---------------------------------------------------------------------------
+
+  //! @brief Get the CUDA event recorded after an input tensor copy/update.
+  cudaEvent_t GetInputReadyEvent(const std::string &name) const;
+
+  //! @brief Get the CUDA event recorded after inference has produced an output tensor.
+  cudaEvent_t GetOutputReadyEvent(const std::string &name) const;
+
+  //! @brief Make a stream wait for the selected input-ready event.
+  bool WaitInputReady(const std::string &name, cudaStream_t stream) const;
+
+  //! @brief Make a stream wait for the selected output-ready event.
+  bool WaitOutputReady(const std::string &name, cudaStream_t stream) const;
+
+  //! @brief Host-side synchronization on a selected input-ready event.
+  bool SynchronizeInput(const std::string &name) const;
+
+  //! @brief Host-side synchronization on a selected output-ready event.
+  bool SynchronizeOutput(const std::string &name) const;
 
   // ---------------------------------------------------------------------------
   // Binding query helpers
@@ -186,6 +212,10 @@ class TensorRTEngine {
   // User-overridden binding addresses (set via SetBindingAddress).
   std::unordered_map<std::string, void *> user_binding_addresses_;
 
+  // Tensor readiness events for cross-stream input/output control.
+  std::unordered_map<std::string, std::shared_ptr<CudaEvent>> input_ready_events_;
+  std::unordered_map<std::string, std::shared_ptr<CudaEvent>> output_ready_events_;
+
   // Plugin library handle
   void *plugin_handle_;
 
@@ -215,6 +245,9 @@ class TensorRTEngine {
   bool Enqueue();
 
   // Helpers
+  bool RecordInputReadyEvent(const std::string &name);
+  bool RecordOutputReadyEvents(cudaStream_t stream);
+  bool WaitEvent(cudaStream_t stream, const std::shared_ptr<CudaEvent> &event) const;
   bool IsDeviceAccessiblePointer(const void *ptr) const;
   bool HasUnresolvedDims(const nvinfer1::Dims &dims) const;
   bool HasConcreteDims(const nvinfer1::Dims &dims) const;

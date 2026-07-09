@@ -144,6 +144,41 @@ TEST_F(ModelInferenceTest, ResNet50AsyncTest) {
   EXPECT_EQ(max_index, 447);  // Same expected result as sync path
 }
 
+TEST_F(ModelInferenceTest, TensorEventControlTest) {
+  const std::string kInputName = "data";
+  const std::string kOutputName = "resnetv17_dense0_fwd";
+  constexpr uint32_t kInputH = 224;
+  constexpr uint32_t kInputW = 224;
+  constexpr uint32_t kOutputLen = 1000;
+
+  auto model = LoadEngine();
+  if (!model || !model->IsLoaded()) {
+    GTEST_SKIP() << "Engine not available, skip TensorEventControlTest";
+  }
+
+  cudaStream_t raw_stream = nullptr;
+  CUDART_CALL(cudaStreamCreate(&raw_stream));
+  EXPECT_TRUE(model->SetStream(raw_stream));
+
+  std::vector<float> input_data(3 * kInputH * kInputW);
+  PreprocessInput(input_data.data());
+  std::vector<float> output_data(kOutputLen);
+
+  EXPECT_TRUE(model->SetBindingShape(kInputName, nvinfer1::Dims4{1, 3, kInputH, kInputW}));
+  EXPECT_TRUE(model->SetInputData(kInputName, input_data.data(), input_data.size() * sizeof(float),
+                                  {1, 3, kInputH, kInputW}, true));
+  EXPECT_NE(model->GetInputReadyEvent(kInputName), nullptr);
+  EXPECT_TRUE(model->WaitInputReady(kInputName, raw_stream));
+
+  EXPECT_TRUE(model->InferAsync());
+  EXPECT_NE(model->GetOutputReadyEvent(kOutputName), nullptr);
+  EXPECT_TRUE(model->WaitOutputReady(kOutputName, raw_stream));
+  EXPECT_TRUE(model->GetOutputData(kOutputName, output_data.data(), output_data.size() * sizeof(float), false));
+  EXPECT_TRUE(model->SynchronizeOutput(kOutputName));
+
+  CUDART_CALL(cudaStreamDestroy(raw_stream));
+}
+
 TEST_F(ModelInferenceTest, BindingQueryTest) {
   const std::string kInputName = "data";
   const std::string kOutputName = "resnetv17_dense0_fwd";
