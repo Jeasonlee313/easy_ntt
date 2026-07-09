@@ -33,8 +33,20 @@ using tensorrt_engine::tensor::Tensor;
 
 // ── Constructor ──────────────────────────────────────────────────────
 
-TensorRTEngine::TensorRTEngine(const std::string &engine_path, const std::string &plugin_path) {
+TensorRTEngine::TensorRTEngine(const std::string &engine_path, const TensorRTEngineConfig &config)
+    : TensorRTEngine(engine_path, "", config) {}
+
+TensorRTEngine::TensorRTEngine(const std::string &engine_path, const std::string &plugin_path,
+                               const TensorRTEngineConfig &config)
+    : config_(config) {
   plugin_handle_ = nullptr;
+  if (!config_.enable_persistent_io_buffers) {
+    config_.allocate_max_profile_buffers = false;
+    config_.auto_freeze_io = false;
+    config_.enable_cuda_graph = false;
+  }
+  cuda_graph_enabled_ = config_.enable_cuda_graph;
+
   if (!plugin_path.empty()) {
     LoadPluginLibrary(plugin_path);
   }
@@ -105,6 +117,9 @@ TensorRTEngine::TensorRTEngine(const std::string &engine_path, const std::string
 
     // Allocate I/O bindings in constructor — output shapes resolved via pre-setting inputs
     AllocateIOBindingsMemory();
+    if (config_.auto_freeze_io && !FreezeIO()) {
+      LOG(WARNING) << "TensorRTEngine auto_freeze_io requested but FreezeIO failed";
+    }
   } catch (const std::exception &e) {
     LOG(ERROR) << "Failed to create engine: " << e.what();
   }
@@ -151,7 +166,7 @@ void TensorRTEngine::AllocateIOBindingsMemory() {
     const bool is_dynamic = IsDynamicBinding(name);
 
     nvinfer1::Dims alloc_shape = engine_shape;
-    if (is_dynamic) {
+    if (is_dynamic && config_.allocate_max_profile_buffers) {
       nvinfer1::Dims profile_shape = GetProfileShape(name, 0, nvinfer1::OptProfileSelector::kMAX);
       if (HasConcreteDims(profile_shape) && profile_shape.nbDims == engine_shape.nbDims) {
         alloc_shape = profile_shape;
@@ -190,7 +205,7 @@ void TensorRTEngine::AllocateIOBindingsMemory() {
            << ", location: " << (tensor_location == nvinfer1::TensorLocation::kHOST ? "HOST" : "DEVICE")
            << ", with shape dims nbDims: " << engine_shape.nbDims << " (" << format_dims(engine_shape) << " )"
            << ", data type: " << utility::dataTypeToString(tensor_type)
-           << (is_dynamic ? " [dynamic, allocated at max profile]" : "");
+           << (is_dynamic && config_.allocate_max_profile_buffers ? " [dynamic, allocated at max profile]" : "");
   }
 
   // Phase 2: infer output shapes from context (after all inputs are set) and allocate outputs.
@@ -205,11 +220,14 @@ void TensorRTEngine::AllocateIOBindingsMemory() {
 
     nvinfer1::Dims alloc_shape = context_->getTensorShape(name.c_str());
     if (!HasConcreteDims(alloc_shape)) {
-      LOG(WARNING) << "Output " << name << ": shape inference returned unresolved shape ("
-                   << format_dims(alloc_shape) << "), falling back to max profile shape";
-      alloc_shape = GetProfileShape(name, 0, nvinfer1::OptProfileSelector::kMAX);
+      LOG(WARNING) << "Output " << name << ": shape inference returned unresolved shape (" << format_dims(alloc_shape)
+                   << ")";
+      if (config_.allocate_max_profile_buffers) {
+        LOG(WARNING) << "Output " << name << ": falling back to max profile shape";
+        alloc_shape = GetProfileShape(name, 0, nvinfer1::OptProfileSelector::kMAX);
+      }
       if (!HasConcreteDims(alloc_shape)) {
-        LOG(WARNING) << "Output " << name << ": max profile shape also invalid, using engine shape with fallback 1";
+        LOG(WARNING) << "Output " << name << ": using engine shape with fallback 1";
         alloc_shape = engine_shape;
       }
     }
@@ -252,13 +270,14 @@ void TensorRTEngine::AllocateIOBindingsMemory() {
            << ", location: " << (tensor_location == nvinfer1::TensorLocation::kHOST ? "HOST" : "DEVICE")
            << ", with shape dims nbDims: " << engine_shape.nbDims << " (" << format_dims(engine_shape) << " )"
            << ", data type: " << utility::dataTypeToString(tensor_type)
-           << (is_dynamic ? " [dynamic, allocated at max profile]" : "");
+           << (is_dynamic && config_.allocate_max_profile_buffers ? " [dynamic, allocated at max profile]" : "");
   }
 }
 
 // ── Cleanup ──────────────────────────────────────────────────────────
 
 void TensorRTEngine::Cleanup() {
+  ResetCudaGraph();
   tensor_map_.clear();
   user_binding_addresses_.clear();
   input_ready_events_.clear();
@@ -280,6 +299,7 @@ bool TensorRTEngine::IsLoaded() const { return (engine_ != nullptr && context_ !
 
 bool TensorRTEngine::SetStream(cudaStream_t stream) {
   if (!stream) return false;
+  ResetCudaGraph();
   external_stream_ = stream;
   return true;
 }
@@ -339,6 +359,31 @@ bool TensorRTEngine::SynchronizeOutput(const std::string &name) const {
     return false;
   }
   return it->second->Synchronize();
+}
+
+void TensorRTEngine::EnableCudaGraph(bool enable) {
+  cuda_graph_enabled_ = enable;
+  config_.enable_cuda_graph = enable;
+  if (!cuda_graph_enabled_) {
+    ResetCudaGraph();
+  }
+}
+
+bool TensorRTEngine::CaptureCudaGraph() {
+  if (!engine_ || !context_) {
+    CUERROR << "Engine not loaded";
+    return false;
+  }
+  cudaStream_t exec_stream = GetCudaStream();
+  for (const auto &pair : tensor_map_) {
+    if (!pair.second->is_input()) continue;
+    auto event_it = input_ready_events_.find(pair.first);
+    if (event_it != input_ready_events_.end() && !WaitEvent(exec_stream, event_it->second)) {
+      LOG(ERROR) << "Failed to wait input ready event for: " << pair.first;
+      return false;
+    }
+  }
+  return CaptureCudaGraph(exec_stream);
 }
 
 // ── Binding introspection ────────────────────────────────────────────
@@ -409,8 +454,15 @@ bool TensorRTEngine::SetInputData(const std::string &name, const void *data, siz
   }
 
   if (!it->second->Reshape(d)) {
-    LOG(ERROR) << "Failed to reshape input tensor " << name << " to requested dims";
-    return false;
+    if (io_frozen_ || !it->second->Resize(d, it->second->dataType())) {
+      LOG(ERROR) << "Failed to reshape input tensor " << name << " to requested dims";
+      return false;
+    }
+    if (!context_->setTensorAddress(name.c_str(), it->second->mutable_data())) {
+      LOG(ERROR) << "Failed to update tensor address after input resize for: " << name;
+      return false;
+    }
+    ResetCudaGraph();
   }
 
   bool ok = false;
@@ -506,20 +558,27 @@ bool TensorRTEngine::InferAsync() {
     }
   }
 
-  if (!io_frozen_) {
-    for (auto &pair : tensor_map_) {
-      void *addr = pair.second->mutable_data();
-      auto user_it = user_binding_addresses_.find(pair.first);
-      if (user_it != user_binding_addresses_.end()) {
-        addr = user_it->second;
-      }
-      if (!context_->setTensorAddress(pair.first.c_str(), addr)) {
-        LOG(ERROR) << "Failed to set tensor address for: " << pair.first;
-        return false;
-      }
-    }
+  if (!io_frozen_ && !BindIOAddresses()) {
+    return false;
   }
-  return Enqueue() && RecordOutputReadyEvents(exec_stream);
+
+  bool launched = false;
+  if (ShouldUseCudaGraph()) {
+    if (!cuda_graph_captured_ || !CudaGraphShapesMatch()) {
+      if (!CaptureCudaGraph(exec_stream)) {
+        LOG(WARNING) << "CUDA Graph capture failed, falling back to enqueueV3";
+        ResetCudaGraph();
+        launched = Enqueue();
+      } else {
+        launched = LaunchCudaGraph(exec_stream);
+      }
+    } else {
+      launched = LaunchCudaGraph(exec_stream);
+    }
+  } else {
+    launched = Enqueue();
+  }
+  return launched && RecordOutputReadyEvents(exec_stream);
 }
 
 // ── Binding shape & profile ──────────────────────────────────────────
@@ -541,7 +600,11 @@ bool TensorRTEngine::SetBindingShape(const std::string &name, const nvinfer1::Di
       return false;
     }
   }
-  return context_->setInputShape(name.c_str(), dims);
+  bool ok = context_->setInputShape(name.c_str(), dims);
+  if (ok && io_frozen_) {
+    ResetCudaGraph();
+  }
+  return ok;
 }
 
 bool TensorRTEngine::SetOptimizationProfile(int32_t profile_index) {
@@ -550,6 +613,7 @@ bool TensorRTEngine::SetOptimizationProfile(int32_t profile_index) {
     LOG(ERROR) << "Cannot switch optimization profile while I/O is frozen";
     return false;
   }
+  ResetCudaGraph();
   return context_->setOptimizationProfileAsync(profile_index, stream_->stream());
 }
 
@@ -622,6 +686,7 @@ bool TensorRTEngine::SetBindingAddress(const std::string &name, void *device_ptr
   }
   CUDA_RETURN_VAL_IF(!context_->setTensorAddress(name.c_str(), device_ptr), false);
   user_binding_addresses_[name] = device_ptr;
+  ResetCudaGraph();
   return true;
 }
 
@@ -637,8 +702,14 @@ void *TensorRTEngine::GetBindingAddress(const std::string &name) const {
 
 bool TensorRTEngine::FreezeIO() {
   if (!engine_ || !context_) return false;
+  if (!config_.enable_persistent_io_buffers) {
+    LOG(ERROR) << "Cannot freeze I/O when persistent I/O buffer fast paths are disabled";
+    return false;
+  }
   if (!io_frozen_) {
     if (!UpdateOutputShapes()) return false;
+    if (!BindIOAddresses()) return false;
+    ResetCudaGraph();
     io_frozen_ = true;
   }
   return io_frozen_;
@@ -817,6 +888,128 @@ bool TensorRTEngine::RecordOutputReadyEvents(cudaStream_t stream) {
 bool TensorRTEngine::WaitEvent(cudaStream_t stream, const std::shared_ptr<CudaEvent> &event) const {
   CUDA_RETURN_VAL_IF(stream == nullptr || event == nullptr, false);
   CUDART_RETURN_CALL(cudaStreamWaitEvent(stream, event->event(), 0));
+  return true;
+}
+
+bool TensorRTEngine::BindIOAddresses() {
+  if (!context_) {
+    LOG(ERROR) << "Engine context not initialized";
+    return false;
+  }
+
+  for (auto &pair : tensor_map_) {
+    void *addr = pair.second->mutable_data();
+    auto user_it = user_binding_addresses_.find(pair.first);
+    if (user_it != user_binding_addresses_.end()) {
+      addr = user_it->second;
+    }
+    if (!context_->setTensorAddress(pair.first.c_str(), addr)) {
+      LOG(ERROR) << "Failed to set tensor address for: " << pair.first;
+      return false;
+    }
+  }
+  return true;
+}
+
+bool TensorRTEngine::CaptureCudaGraph(cudaStream_t stream) {
+  if (!ShouldUseCudaGraph()) {
+    LOG(ERROR) << "CUDA Graph capture requires enabled CUDA Graph and frozen I/O";
+    return false;
+  }
+  CUDA_RETURN_VAL_IF(stream == nullptr, false);
+
+  ResetCudaGraph();
+
+  cudaError_t err = cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+  if (err != cudaSuccess) {
+    LOG(ERROR) << "cudaStreamBeginCapture failed: " << cudaGetErrorString(err);
+    cudaGetLastError();
+    return false;
+  }
+
+  bool enqueue_ok = context_->enqueueV3(stream);
+  cudaGraph_t captured_graph = nullptr;
+  err = cudaStreamEndCapture(stream, &captured_graph);
+  if (!enqueue_ok || err != cudaSuccess || captured_graph == nullptr) {
+    if (err != cudaSuccess) {
+      LOG(ERROR) << "cudaStreamEndCapture failed: " << cudaGetErrorString(err);
+      cudaGetLastError();
+    } else if (!enqueue_ok) {
+      LOG(ERROR) << "TensorRT enqueueV3 failed during CUDA Graph capture";
+    } else {
+      LOG(ERROR) << "CUDA Graph capture returned a null graph";
+    }
+    if (captured_graph != nullptr) {
+      cudaGraphDestroy(captured_graph);
+    }
+    return false;
+  }
+
+  cudaGraphExec_t captured_exec = nullptr;
+  err = cudaGraphInstantiate(&captured_exec, captured_graph, 0);
+  if (err != cudaSuccess) {
+    LOG(ERROR) << "cudaGraphInstantiate failed: " << cudaGetErrorString(err);
+    cudaGetLastError();
+    cudaGraphDestroy(captured_graph);
+    return false;
+  }
+
+  cuda_graph_ = captured_graph;
+  cuda_graph_exec_ = captured_exec;
+  cuda_graph_captured_ = true;
+  SnapshotCudaGraphShapes();
+  return true;
+}
+
+bool TensorRTEngine::LaunchCudaGraph(cudaStream_t stream) {
+  CUDA_RETURN_VAL_IF(stream == nullptr || cuda_graph_exec_ == nullptr, false);
+  CUDART_RETURN_CALL(cudaGraphLaunch(cuda_graph_exec_, stream));
+  return true;
+}
+
+void TensorRTEngine::ResetCudaGraph() {
+  if (cuda_graph_exec_ != nullptr) {
+    cudaGraphExecDestroy(cuda_graph_exec_);
+    cuda_graph_exec_ = nullptr;
+  }
+  if (cuda_graph_ != nullptr) {
+    cudaGraphDestroy(cuda_graph_);
+    cuda_graph_ = nullptr;
+  }
+  cuda_graph_tensor_shapes_.clear();
+  cuda_graph_captured_ = false;
+}
+
+bool TensorRTEngine::ShouldUseCudaGraph() const {
+  return cuda_graph_enabled_ && io_frozen_ && engine_ != nullptr && context_ != nullptr;
+}
+
+bool TensorRTEngine::CudaGraphShapesMatch() const {
+  if (!cuda_graph_captured_) return false;
+  for (const auto &pair : tensor_map_) {
+    auto shape_it = cuda_graph_tensor_shapes_.find(pair.first);
+    if (shape_it == cuda_graph_tensor_shapes_.end()) return false;
+
+    nvinfer1::Dims current = pair.second->is_input() ? context_->getTensorShape(pair.first.c_str())
+                                                     : pair.second->dims();
+    if (!SameDims(current, shape_it->second)) return false;
+  }
+  return true;
+}
+
+void TensorRTEngine::SnapshotCudaGraphShapes() {
+  cuda_graph_tensor_shapes_.clear();
+  for (const auto &pair : tensor_map_) {
+    cuda_graph_tensor_shapes_[pair.first] =
+        pair.second->is_input() ? context_->getTensorShape(pair.first.c_str()) : pair.second->dims();
+  }
+}
+
+bool TensorRTEngine::SameDims(const nvinfer1::Dims &lhs, const nvinfer1::Dims &rhs) const {
+  if (lhs.nbDims != rhs.nbDims) return false;
+  for (int32_t i = 0; i < lhs.nbDims; ++i) {
+    if (lhs.d[i] != rhs.d[i]) return false;
+  }
   return true;
 }
 
