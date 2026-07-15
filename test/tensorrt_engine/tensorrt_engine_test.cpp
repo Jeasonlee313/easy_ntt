@@ -31,6 +31,10 @@ class ModelInferenceTest : public ::testing::Test {
 
  protected:
   static std::shared_ptr<TensorRTEngine> LoadEngine() {
+    return LoadEngine(TensorRTEngineConfig::Default());
+  }
+
+  static std::shared_ptr<TensorRTEngine> LoadEngine(const TensorRTEngineConfig &config) {
     const std::string kEnginePath = "test_data/resnet/ResNet50.engine";
 
     // CI/CD environments typically don't have the prebuilt engine file.
@@ -40,7 +44,7 @@ class ModelInferenceTest : public ::testing::Test {
       return nullptr;
     }
 
-    auto model = std::make_shared<TensorRTEngine>(kEnginePath);
+    auto model = std::make_shared<TensorRTEngine>(kEnginePath, config);
     return model;
   }
 
@@ -142,6 +146,177 @@ TEST_F(ModelInferenceTest, ResNet50AsyncTest) {
   }
   CUINFO << "async max_index: " << max_index << " max_value: " << max_value;
   EXPECT_EQ(max_index, 447);  // Same expected result as sync path
+}
+
+TEST_F(ModelInferenceTest, TensorEventControlTest) {
+  const std::string kInputName = "data";
+  const std::string kOutputName = "resnetv17_dense0_fwd";
+  constexpr uint32_t kInputH = 224;
+  constexpr uint32_t kInputW = 224;
+  constexpr uint32_t kOutputLen = 1000;
+
+  auto model = LoadEngine();
+  if (!model || !model->IsLoaded()) {
+    GTEST_SKIP() << "Engine not available, skip TensorEventControlTest";
+  }
+
+  cudaStream_t raw_stream = nullptr;
+  CUDART_CALL(cudaStreamCreate(&raw_stream));
+  EXPECT_TRUE(model->SetStream(raw_stream));
+
+  std::vector<float> input_data(3 * kInputH * kInputW);
+  PreprocessInput(input_data.data());
+  std::vector<float> output_data(kOutputLen);
+
+  EXPECT_TRUE(model->SetBindingShape(kInputName, nvinfer1::Dims4{1, 3, kInputH, kInputW}));
+  EXPECT_TRUE(model->SetInputData(kInputName, input_data.data(), input_data.size() * sizeof(float),
+                                  {1, 3, kInputH, kInputW}, true));
+  EXPECT_NE(model->GetInputReadyEvent(kInputName), nullptr);
+  EXPECT_TRUE(model->WaitInputReady(kInputName, raw_stream));
+
+  EXPECT_TRUE(model->InferAsync());
+  EXPECT_NE(model->GetOutputReadyEvent(kOutputName), nullptr);
+  EXPECT_TRUE(model->WaitOutputReady(kOutputName, raw_stream));
+  EXPECT_TRUE(model->GetOutputData(kOutputName, output_data.data(), output_data.size() * sizeof(float), false));
+  EXPECT_TRUE(model->SynchronizeOutput(kOutputName));
+
+  CUDART_CALL(cudaStreamDestroy(raw_stream));
+}
+
+TEST_F(ModelInferenceTest, CudaGraphFrozenIOTest) {
+  const std::string kInputName = "data";
+  const std::string kOutputName = "resnetv17_dense0_fwd";
+  constexpr uint32_t kInputH = 224;
+  constexpr uint32_t kInputW = 224;
+  constexpr uint32_t kOutputLen = 1000;
+
+  auto model = LoadEngine();
+  if (!model || !model->IsLoaded()) {
+    GTEST_SKIP() << "Engine not available, skip CudaGraphFrozenIOTest";
+  }
+
+  EXPECT_TRUE(model->IsIOFrozen());
+  EXPECT_TRUE(model->IsCudaGraphEnabled());
+  EXPECT_FALSE(model->IsCudaGraphCaptured());
+
+  float input_data[3 * kInputW * kInputH];
+  float output_data[kOutputLen];
+  PreprocessInput(input_data);
+
+  EXPECT_TRUE(model->SetBindingShape(kInputName, nvinfer1::Dims4{1, 3, kInputH, kInputW}));
+  EXPECT_TRUE(model->SetInputData(kInputName, input_data, 3 * kInputH * kInputW * sizeof(float),
+                                  {1, 3, kInputH, kInputW}, false));
+  EXPECT_FALSE(model->IsCudaGraphCaptured());
+
+  EXPECT_TRUE(model->InferAsync());
+  EXPECT_TRUE(model->IsCudaGraphCaptured());
+  EXPECT_TRUE(model->InferAsync());
+  EXPECT_TRUE(model->IsCudaGraphCaptured());
+
+  EXPECT_TRUE(model->GetOutputData(kOutputName, output_data, kOutputLen * sizeof(float), false));
+}
+
+TEST_F(ModelInferenceTest, CudaGraphRecapturesAfterFrozenShapeChangeTest) {
+  const std::string kInputName = "data";
+  constexpr uint32_t kInputH = 224;
+  constexpr uint32_t kInputW = 224;
+  constexpr uint32_t kMaxBatch = 4;
+
+  auto model = LoadEngine();
+  if (!model || !model->IsLoaded()) {
+    GTEST_SKIP() << "Engine not available, skip CudaGraphRecapturesAfterFrozenShapeChangeTest";
+  }
+
+  auto input_tensor = model->GetBindingByName(kInputName);
+  ASSERT_NE(input_tensor, nullptr);
+
+  EXPECT_TRUE(model->SetBindingShape(kInputName, nvinfer1::Dims4{1, 3, kInputH, kInputW}));
+  std::vector<float> input_data(1 * 3 * kInputH * kInputW, 1.0f);
+  EXPECT_TRUE(model->SetInputData(kInputName, input_data.data(), input_data.size() * sizeof(float),
+                                  {1, 3, kInputH, kInputW}, false));
+  EXPECT_TRUE(model->Infer());
+  EXPECT_TRUE(model->FreezeIO());
+
+  EXPECT_TRUE(model->InferAsync());
+  EXPECT_TRUE(model->IsCudaGraphCaptured());
+
+  EXPECT_TRUE(model->SetBindingShape(
+      kInputName, nvinfer1::Dims4{static_cast<int64_t>(kMaxBatch), 3, kInputH, kInputW}));
+  EXPECT_FALSE(model->IsCudaGraphCaptured());
+
+  std::vector<float> input_data_max(kMaxBatch * 3 * kInputH * kInputW, 1.0f);
+  EXPECT_TRUE(model->SetInputData(kInputName, input_data_max.data(), input_data_max.size() * sizeof(float),
+                                  {static_cast<int64_t>(kMaxBatch), 3, kInputH, kInputW}, true));
+  EXPECT_TRUE(model->InferAsync());
+  EXPECT_TRUE(model->IsCudaGraphCaptured());
+}
+
+TEST_F(ModelInferenceTest, ConfigCompatibilityDisablesCudaGraph) {
+  const std::string kInputName = "data";
+  constexpr uint32_t kInputH = 224;
+  constexpr uint32_t kInputW = 224;
+
+  auto model = LoadEngine(TensorRTEngineConfig::Compatibility());
+  if (!model || !model->IsLoaded()) {
+    GTEST_SKIP() << "Engine not available, skip ConfigCompatibilityDisablesCudaGraph";
+  }
+
+  EXPECT_FALSE(model->IsCudaGraphEnabled());
+  EXPECT_FALSE(model->IsCudaGraphCaptured());
+
+  EXPECT_TRUE(model->SetBindingShape(kInputName, nvinfer1::Dims4{1, 3, kInputH, kInputW}));
+  std::vector<float> input_data(1 * 3 * kInputH * kInputW, 1.0f);
+  EXPECT_TRUE(model->SetInputData(kInputName, input_data.data(), input_data.size() * sizeof(float),
+                                  {1, 3, kInputH, kInputW}, false));
+  EXPECT_TRUE(model->Infer());
+  EXPECT_TRUE(model->FreezeIO());
+  EXPECT_TRUE(model->InferAsync());
+  EXPECT_FALSE(model->IsCudaGraphCaptured());
+}
+
+TEST_F(ModelInferenceTest, ConfigFrozenCudaGraphAutoFreezes) {
+  const std::string kInputName = "data";
+  constexpr uint32_t kInputH = 224;
+  constexpr uint32_t kInputW = 224;
+
+  auto model = LoadEngine(TensorRTEngineConfig::FrozenCudaGraph());
+  if (!model || !model->IsLoaded()) {
+    GTEST_SKIP() << "Engine not available, skip ConfigFrozenCudaGraphAutoFreezes";
+  }
+
+  EXPECT_TRUE(model->IsIOFrozen());
+  EXPECT_TRUE(model->IsCudaGraphEnabled());
+  EXPECT_FALSE(model->IsCudaGraphCaptured());
+
+  EXPECT_TRUE(model->SetBindingShape(kInputName, nvinfer1::Dims4{1, 3, kInputH, kInputW}));
+  std::vector<float> input_data(1 * 3 * kInputH * kInputW, 1.0f);
+  EXPECT_TRUE(model->SetInputData(kInputName, input_data.data(), input_data.size() * sizeof(float),
+                                  {1, 3, kInputH, kInputW}, false));
+  EXPECT_TRUE(model->InferAsync());
+  EXPECT_TRUE(model->IsCudaGraphCaptured());
+}
+
+TEST_F(ModelInferenceTest, ConfigMinimalMemoryCanGrowInputBuffers) {
+  const std::string kInputName = "data";
+  constexpr uint32_t kInputH = 224;
+  constexpr uint32_t kInputW = 224;
+
+  auto model = LoadEngine(TensorRTEngineConfig::MinimalMemory());
+  if (!model || !model->IsLoaded()) {
+    GTEST_SKIP() << "Engine not available, skip ConfigMinimalMemoryCanGrowInputBuffers";
+  }
+
+  EXPECT_FALSE(model->IsCudaGraphEnabled());
+  auto input_tensor = model->GetBindingByName(kInputName);
+  ASSERT_NE(input_tensor, nullptr);
+  const size_t initial_capacity = input_tensor->capacity_bytes();
+
+  EXPECT_TRUE(model->SetBindingShape(kInputName, nvinfer1::Dims4{2, 3, kInputH, kInputW}));
+  std::vector<float> input_data(2 * 3 * kInputH * kInputW, 1.0f);
+  EXPECT_TRUE(model->SetInputData(kInputName, input_data.data(), input_data.size() * sizeof(float),
+                                  {2, 3, kInputH, kInputW}, false));
+  EXPECT_GE(input_tensor->capacity_bytes(), input_data.size() * sizeof(float));
+  EXPECT_GE(input_tensor->capacity_bytes(), initial_capacity);
 }
 
 TEST_F(ModelInferenceTest, BindingQueryTest) {
@@ -288,7 +463,7 @@ TEST_F(ModelInferenceTest, FreezeIOStaticTest) {
                                   {1, 3, kInputH, kInputW}, false));
   EXPECT_TRUE(model->Infer());
 
-  EXPECT_FALSE(model->IsIOFrozen());
+  EXPECT_TRUE(model->IsIOFrozen());
   EXPECT_TRUE(model->FreezeIO());
   EXPECT_TRUE(model->IsIOFrozen());
 

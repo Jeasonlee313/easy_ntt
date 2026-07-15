@@ -11,20 +11,67 @@
 #include <unordered_map>
 #include <vector>
 
+#include "driver/cuda_event.h"
 #include "driver/cuda_stream.h"
 #include "tensorrt_engine/tensor.h"
 #include "tensorrt_engine/tensorrt_utility.hpp"
 #include "tensorrt_engine/trt_logger.h"
 
 namespace tensorrt_engine {
+using driver::event::CudaEvent;
 using driver::stream::CudaStream;
 using tensorrt_engine::logger::Logger;
 using tensorrt_engine::tensor::Tensor;
 
+struct TensorRTEngineConfig {
+  //! @brief Keep I/O Tensor storage alive for the engine lifetime.
+  bool enable_persistent_io_buffers = true;
+
+  //! @brief Allocate dynamic-profile I/O tensors at max profile shape when possible.
+  bool allocate_max_profile_buffers = true;
+
+  //! @brief Call FreezeIO() after constructor allocation succeeds.
+  bool auto_freeze_io = true;
+
+  //! @brief Enable CUDA Graph execution after I/O addresses are frozen.
+  bool enable_cuda_graph = true;
+
+  //! @brief Default fast path: persistent max-profile buffers, frozen I/O addresses, CUDA Graph enabled.
+  static TensorRTEngineConfig Default() { return TensorRTEngineConfig{}; }
+
+  //! @brief Compatibility path: persistent buffers, explicit FreezeIO, no CUDA Graph execution.
+  static TensorRTEngineConfig Compatibility() {
+    TensorRTEngineConfig config;
+    config.auto_freeze_io = false;
+    config.enable_cuda_graph = false;
+    return config;
+  }
+
+  //! @brief Low-latency repeated inference: persistent max buffers, auto FreezeIO, CUDA Graph enabled.
+  static TensorRTEngineConfig FrozenCudaGraph() {
+    TensorRTEngineConfig config;
+    config.auto_freeze_io = true;
+    config.enable_cuda_graph = true;
+    return config;
+  }
+
+  //! @brief Avoid max-profile allocation; tensors may reallocate as shapes grow.
+  static TensorRTEngineConfig MinimalMemory() {
+    TensorRTEngineConfig config;
+    config.enable_persistent_io_buffers = false;
+    config.allocate_max_profile_buffers = false;
+    config.auto_freeze_io = false;
+    config.enable_cuda_graph = false;
+    return config;
+  }
+};
+
 class TensorRTEngine {
  public:
   // Updated constructor that takes engine path, optional plugin path, and optional CUDA stream
-  TensorRTEngine(const std::string &engine_path, const std::string &plugin_path = "");
+  TensorRTEngine(const std::string &engine_path, const std::string &plugin_path = "",
+                 const TensorRTEngineConfig &config = TensorRTEngineConfig::Default());
+  TensorRTEngine(const std::string &engine_path, const TensorRTEngineConfig &config);
   ~TensorRTEngine();
 
   std::shared_ptr<Tensor> GetBindingByName(const std::string &name) const;
@@ -38,7 +85,9 @@ class TensorRTEngine {
   // Get output data
   bool GetOutputData(const std::string &name, void *data, size_t size_bytes, bool async);
 
-  // Run inference (synchronous)
+  // Run inference (synchronous). Deprecated: use InferAsync() plus event control
+  // or explicit Synchronize() instead.
+  [[deprecated("Use InferAsync() with tensor event control or explicit Synchronize() instead.")]]
   bool Infer();
 
   // Run inference (asynchronous)
@@ -59,6 +108,50 @@ class TensorRTEngine {
 
   //! @brief Synchronize the execution stream.
   bool Synchronize() const;
+
+  // ---------------------------------------------------------------------------
+  // Tensor event control
+  // ---------------------------------------------------------------------------
+
+  //! @brief Get the CUDA event recorded after an input tensor copy/update.
+  cudaEvent_t GetInputReadyEvent(const std::string &name) const;
+
+  //! @brief Get the CUDA event recorded after inference has produced an output tensor.
+  cudaEvent_t GetOutputReadyEvent(const std::string &name) const;
+
+  //! @brief Make a stream wait for the selected input-ready event.
+  bool WaitInputReady(const std::string &name, cudaStream_t stream) const;
+
+  //! @brief Make a stream wait for the selected output-ready event.
+  bool WaitOutputReady(const std::string &name, cudaStream_t stream) const;
+
+  //! @brief Host-side synchronization on a selected input-ready event.
+  bool SynchronizeInput(const std::string &name) const;
+
+  //! @brief Host-side synchronization on a selected output-ready event.
+  bool SynchronizeOutput(const std::string &name) const;
+
+  // ---------------------------------------------------------------------------
+  // CUDA Graph control
+  // ---------------------------------------------------------------------------
+
+  //! @brief Enable/disable CUDA Graph execution after I/O addresses are frozen.
+  void EnableCudaGraph(bool enable);
+
+  //! @brief Capture the current frozen-I/O inference path into a CUDA Graph.
+  bool CaptureCudaGraph();
+
+  //! @brief Destroy the captured CUDA Graph and fall back to enqueueV3 until recaptured.
+  void ResetCudaGraph();
+
+  //! @brief Check whether CUDA Graph execution is enabled.
+  bool IsCudaGraphEnabled() const { return cuda_graph_enabled_; }
+
+  //! @brief Check whether a CUDA Graph executable is currently captured.
+  bool IsCudaGraphCaptured() const { return cuda_graph_captured_; }
+
+  //! @brief Get the runtime behavior config used by this engine.
+  const TensorRTEngineConfig &config() const { return config_; }
 
   // ---------------------------------------------------------------------------
   // Binding query helpers
@@ -168,6 +261,7 @@ class TensorRTEngine {
 
  private:
   // TensorRT objects
+  TensorRTEngineConfig config_;
   Logger logger_;
   std::shared_ptr<nvinfer1::IRuntime> runtime_;
   std::shared_ptr<nvinfer1::ICudaEngine> engine_;
@@ -186,6 +280,10 @@ class TensorRTEngine {
   // User-overridden binding addresses (set via SetBindingAddress).
   std::unordered_map<std::string, void *> user_binding_addresses_;
 
+  // Tensor readiness events for cross-stream input/output control.
+  std::unordered_map<std::string, std::shared_ptr<CudaEvent>> input_ready_events_;
+  std::unordered_map<std::string, std::shared_ptr<CudaEvent>> output_ready_events_;
+
   // Plugin library handle
   void *plugin_handle_;
 
@@ -195,9 +293,16 @@ class TensorRTEngine {
   // Fast-path flags
   bool io_frozen_ = false;
   bool static_execution_enabled_ = false;
+  bool cuda_graph_enabled_ = true;
+  bool cuda_graph_captured_ = false;
 
   // True if the loaded engine has at least one dynamic binding.
   bool engine_has_dynamic_bindings_ = false;
+
+  // CUDA Graph state for frozen persistent I/O buffers.
+  cudaGraph_t cuda_graph_ = nullptr;
+  cudaGraphExec_t cuda_graph_exec_ = nullptr;
+  std::unordered_map<std::string, nvinfer1::Dims> cuda_graph_tensor_shapes_;
 
   // Clean up resources
   void Cleanup();
@@ -215,6 +320,16 @@ class TensorRTEngine {
   bool Enqueue();
 
   // Helpers
+  bool RecordInputReadyEvent(const std::string &name);
+  bool RecordOutputReadyEvents(cudaStream_t stream);
+  bool WaitEvent(cudaStream_t stream, const std::shared_ptr<CudaEvent> &event) const;
+  bool BindIOAddresses();
+  bool CaptureCudaGraph(cudaStream_t stream);
+  bool LaunchCudaGraph(cudaStream_t stream);
+  bool ShouldUseCudaGraph() const;
+  bool CudaGraphShapesMatch() const;
+  void SnapshotCudaGraphShapes();
+  bool SameDims(const nvinfer1::Dims &lhs, const nvinfer1::Dims &rhs) const;
   bool IsDeviceAccessiblePointer(const void *ptr) const;
   bool HasUnresolvedDims(const nvinfer1::Dims &dims) const;
   bool HasConcreteDims(const nvinfer1::Dims &dims) const;
